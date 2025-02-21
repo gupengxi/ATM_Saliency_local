@@ -13,7 +13,7 @@ checkpoints
 images_test
 outputs
 ooal_data
-ooal_models
+ooal-models
 output_test
 output
 pytorch-grad-cam
