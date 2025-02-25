@@ -35,6 +35,7 @@ from pathlib import Path
 from PIL import Image
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
+# torch.set_float32_matmul_precision('high')
 
 
 output_gif_path = "track_video.gif"
@@ -416,7 +417,7 @@ def main():
                     cv2.imwrite(os.path.join(OUTPUT_DIR, "groundingdino_annotated_image.jpg"), annotated_frame)
                     # track_i_t, vi_i_t = sample_tracks(tracks=track[i, t], vis=vi[i, t], num_samples=64)
                     track_i_t, vi_i_t = sample_tracks_object_1(tracks=track_ori[b, i, t], vis=vi_ori[b, i, t], num_samples=128, uniform_ratio=0.25, object_boxes=boxes)
-                    sample_track_per_time.append(track_i_t)
+                    sample_track_per_time.append(track_i_t.cuda())
                     sample_vi_per_time.append(vi_i_t)
                 sample_track_per_view.append(torch.stack(sample_track_per_time, dim=0))
                 sample_vi_per_view.append(torch.stack(sample_vi_per_time, dim=0))
@@ -452,8 +453,9 @@ def main():
         norm_add = track_gray_maps_norm + ooal_images_norm 
         print(torch.max(norm_add))
         norm_add_norm = normalize_grayscale_image(norm_add)
-        print(torch.max(norm_add_norm))
+        # print(torch.max(norm_add_norm))
         combined_images = norm_add_norm * 255
+        combined_images = torch.clamp(combined_images, 0 , 255)
         combined_images = combined_images.to(torch.uint8)
         #########################################################
 
