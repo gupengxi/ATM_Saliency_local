@@ -289,6 +289,14 @@ def normalize_grayscale_image(img):
     img_min = torch.min(img)
     img_max = torch.max(img)
     return (img - img_min) / (img_max - img_min)
+def reshape_transform_local(tensor, height=64, width=64):
+    result = tensor.reshape(tensor.size(0),
+        height, width, tensor.size(2))
+
+    # Bring the channels to the first dimension,
+    # like in CNNs.
+    result = result.transpose(2, 3).transpose(1, 2)
+    return result
 
 
 import torchvision.transforms.functional as F
@@ -301,7 +309,12 @@ def transform_img(image):
     return image_normalized
 def main():
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    grounding_model = load_model(
+    grounding_model1 = load_model(
+        model_config_path="grounding_dino/groundingdino/config/GroundingDINO_SwinB_cfg.py",
+        model_checkpoint_path="gdino_checkpoints/groundingdino_swinb_cogcoor.pth",
+        device=DEVICE
+    )
+    grounding_model2 = load_model(
         model_config_path="grounding_dino/groundingdino/config/GroundingDINO_SwinB_cfg.py",
         model_checkpoint_path="gdino_checkpoints/groundingdino_swinb_cogcoor.pth",
         device=DEVICE
@@ -325,6 +338,7 @@ def main():
         aug_prob=0.9
     )
     train_loader = get_dataloader(train_dataset, mode="train", num_workers=1, batch_size=4)
+    image_dir = "custom_dataset/images"
     k = 0
     for obs, track_obs, track, task_emb, action, extra_states, track_ori ,vi_ori in tqdm(train_loader):
         # track = track.reshape(-1, 16, 64, 2)
@@ -332,8 +346,15 @@ def main():
 
         # track_vid_reshape = track_vid.view(4, 2, 10, 3, 128, 128)
         # boxes, confidences, labels = [], [], []
+        for batch_idx in range(4):
+            for view_idx in range(2):
+                for time_idx in range(10):
+                    image = obs[batch_idx,view_idx,time_idx].permute(1, 2, 0).cpu().numpy().astype(np.uint8)  # (H, W, C)
+                    image = Image.fromarray(image)
+                    image.save(os.path.join(image_dir, f"image_pick_up_the_black_bowl_between_the_plate_and_the_ramekin_and_place_it_on_the_plate_{k}_{batch_idx}_{view_idx}_{time_idx}.png"))
         # sample tracks
         sample_track, sample_vi = [], []
+        gd_cams = []
         for b in range (4):
             sample_track_per_view, sample_vi_per_view = [], []
             for i in range(2):
@@ -351,7 +372,7 @@ def main():
                     image = transform_img(image)
                     # print(image)
                     boxes, confidences, labels = predict(
-                        model=grounding_model,
+                        model=grounding_model1,
                         image=image,
                         caption="the gray bowl. the pink-white plate. the white head. the white robot.",
                         box_threshold=0.15,
@@ -376,7 +397,7 @@ def main():
 
                     
                     
-                    print(boxes)
+                    # print(boxes)
                     
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         if torch.cuda.get_device_properties(0).major >= 8:
@@ -397,234 +418,119 @@ def main():
                         for class_name, confidence
                         in zip(class_names, confidences)
                     ]
-                    detections = sv.Detections(
-                        xyxy=boxes,  # (n, 4)
-                        mask=masks.astype(bool),  # (n, h, w)
-                        class_id=class_ids
-                    )
-                    box_annotator = sv.BoxAnnotator()
+                    # detections = sv.Detections(
+                    #     xyxy=boxes,  # (n, 4)
+                    #     mask=masks.astype(bool),  # (n, h, w)
+                    #     class_id=class_ids
+                    # )
+                    # box_annotator = sv.BoxAnnotator()
 
                     scene_tensor = obs[b, i, t]
 
                     # 将 Tensor 转换为 NumPy ndarray
                     scene_ndarray = scene_tensor.permute(1, 2, 0).cpu().numpy()
                     scene_ndarray = scene_ndarray.astype(np.uint8)
-
-                    
-                    annotated_frame = box_annotator.annotate(scene=img.copy(), detections=detections)
-                    mask_annotator = sv.MaskAnnotator()
-                    annotated_frame = mask_annotator.annotate(scene=annotated_frame, detections=detections)
-                    cv2.imwrite(os.path.join(OUTPUT_DIR, "groundingdino_annotated_image.jpg"), annotated_frame)
-                    # track_i_t, vi_i_t = sample_tracks(tracks=track[i, t], vis=vi[i, t], num_samples=64)
+                    # annotated_frame = box_annotator.annotate(scene=img.copy(), detections=detections)
+                    # mask_annotator = sv.MaskAnnotator()
+                    # annotated_frame = mask_annotator.annotate(scene=annotated_frame, detections=detections)
                     track_i_t, vi_i_t = sample_tracks_object_1(tracks=track_ori[b, i, t], vis=vi_ori[b, i, t], num_samples=128, uniform_ratio=0.25, object_boxes=boxes)
                     sample_track_per_time.append(track_i_t.cuda())
                     sample_vi_per_time.append(vi_i_t)
+                    image_c = image
+
+                    #generate gd cam
+                    preprocess = transforms.Compose([
+                        transforms.Resize(256),
+                        # transforms.Resize(256),
+                        transforms.CenterCrop(256),
+                        # transforms.ToTensor(),  # 将图像转换为张量
+                        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # 归一化
+                    ])
+                    im_for_gd = preprocess(image_c)
+                    # print(f"shape imforgd {im_for_gd.shape}")
+                    im_for_gd = im_for_gd.unsqueeze(0)
+                    # print(f"shape imforgd {im_for_gd.shape}")
+                    target_layers = [grounding_model2.backbone[0].layers[0].blocks[-1].norm1]
+                    cam_algorithm = KPCA_CAM(model=grounding_model2, target_layers=target_layers,reshape_transform=reshape_transform_local)
+                    gd_cam = cam_algorithm(input_tensor=im_for_gd)
+                    gd_cams.append(gd_cam)
                 sample_track_per_view.append(torch.stack(sample_track_per_time, dim=0))
                 sample_vi_per_view.append(torch.stack(sample_vi_per_time, dim=0))
             sample_track.append(torch.stack(sample_track_per_view, dim=0))
             sample_vi.append(torch.stack(sample_vi_per_view, dim=0))
         track_obj = torch.stack(sample_track, dim=0)
         vi_obj = torch.stack(sample_vi, dim=0)
-
+        gd_cams = torch.tensor(gd_cams)#80 1 256 256
+        # 1. 移除通道维度（通过 squeeze）
+        gd_cams = gd_cams.squeeze(1)  # 形状变为 [80, 256, 256]
+        import torch.nn.functional as F1
+        # 2. 调整空间尺寸（使用插值或池化）
+        gd_cams = F1.interpolate(gd_cams.unsqueeze(1), size=(128, 128), mode='bilinear', align_corners=False)
+        gd_cams = gd_cams.squeeze(1)
         track_obj = track_obj.reshape(-1, 16, 128, 2)
-        # track_vid = tracks_to_video(track_obj, img_size=128)
-
-        # track_vid_reshape = track_vid.view(4, 2, 10, 3, 128, 128)
-        # track_vid = tracks_to_saliency_map_v2(track_obj, img_size=128)
         track_gray_maps = tracks_to_grayscale_maps(track_obj, img_size=128)
-        
-        # track_vid_reshape = np.reshape(track_vid, (4,2,10,128,128,3))
-
-        # track_vid_reshape = track_vid.view(4,2,10,3,128,128)#uncomment when using other methods
-        # track_gray_maps_reshape = np.reshape(track_gray_maps, (4,2,10,128,128,3))
-        # print(f"shape of track_vid_reshape is {track_gray_maps_reshape.shape}")
-
         ooal_images = process_images(obs, model, 128)
         track_gray_maps = torch.tensor(track_gray_maps)
         ooal_images = torch.tensor(ooal_images)
 
-
-        # normalize method
-        #########################################################
+        # normalize
         track_gray_maps_norm = normalize_grayscale_image(track_gray_maps)
-        # print(torch.max(track_gray_maps_norm))
         ooal_images_norm = normalize_grayscale_image(ooal_images)
-        # print(torch.max(ooal_images_norm))
-        norm_add = track_gray_maps_norm + ooal_images_norm 
-        print(torch.max(norm_add))
+        gd_cams_norm = normalize_grayscale_image(gd_cams)
+        norm_add = track_gray_maps_norm + ooal_images_norm + gd_cams_norm
         norm_add_norm = normalize_grayscale_image(norm_add)
-        # print(torch.max(norm_add_norm))
         combined_images = norm_add_norm * 255
         combined_images = torch.clamp(combined_images, 0 , 255)
         combined_images = combined_images.to(torch.uint8)
-        #########################################################
-
-
-        # hyperparam method
-        #########################################################
-        # ooal_images =  ooal_images*1000
-        # track_gray_maps = track_gray_maps 
-        # # # 设定阈值
-        # # threshold = 50
-
-        # # # 将小于阈值的像素值置为0
-        # # ooal_images = torch.where(ooal_images < threshold, torch.tensor(0.0), ooal_images)
-
-        # # 按元素相加
-        # # combined_images = track_gray_maps + ooal_images
-        # # combined_images = track_gray_maps
-        # combined_images = ooal_images
-        # print(track_gray_maps)
-        #########################################################
-        # print(ooal_images)
-        # combined_images = combined_images.to(torch.uint8)
-
-        # # 确保图像值在 0 到 255 之间，并转换回 uint8 类型
-        # combined_images = torch.clamp(combined_images, 0, 255).to(torch.uint8)
-        # 先分别scale到0-1，加起来之后再scale到0-1
-
-        # 将 track_gray_maps 和 ooal_images 都归一化到 0 到 1 之间
-        # track_min, track_max = track_gray_maps.min(), track_gray_maps.max()
-        # ooal_min, ooal_max = ooal_images.min(), ooal_images.max()
-
-        # track_gray_maps_norm = (track_gray_maps - track_min) / (track_max - track_min)
-        # ooal_images_norm = (ooal_images - ooal_min) / (ooal_max - ooal_min)
-
-        # 将它们放缩到 0 到 255 之间
-        # track_gray_maps_scaled = (track_gray_maps_norm * 255).to(torch.uint8)
-        # ooal_images_scaled = (ooal_images_norm * 255).to(torch.uint8)
-
-        # 合并图像
-        # combined_images = track_gray_maps_scaled + ooal_images_scaled
-
-        print(f"shape combined images is {combined_images.shape}")
         combined_images_reshape = combined_images.view(4,2,10,128,128)
-
-        for b1 in range(combined_images_reshape.shape[0]):
-            for v1 in range(combined_images_reshape.shape[1]):
-
-                for t in range(combined_images_reshape.shape[2]):  # 遍历时间步
-                    # Get the current observation frame and the corresponding saliency map frame
-                    obs_frame = obs[b1, v1, t].permute(1, 2, 0).cpu().numpy().astype(np.uint8)  # (H, W, C)
-                    saliency_frame = combined_images_reshape[b1, v1, t, :, :]  # (H, W)
-                    
-                    # Overlay the saliency map onto the observation frame
-                    blended_frame = overlay_images_v1(obs_frame, saliency_frame, alpha=0.1, beta=0.5)
-                    blended_frame_tensor = torch.from_numpy(blended_frame)
-                    saliency_frame = saliency_frame.unsqueeze(0)  # 变成 (1, H, W)
-
-                    # 然后，如果需要将灰度图扩展到 RGB 形状 (3, H, W)，你可以重复它的通道
-                    saliency_frame = saliency_frame.repeat(3, 1, 1)  # 变成 (3, H, W)
-
-                    print(saliency_frame.shape)
-                    print(blended_frame_tensor.shape)
-                    blended_frame_tensor = blended_frame_tensor.permute(2, 0, 1) 
-
-                    cat_frame = torch.cat([obs[b1,v1,t], saliency_frame, blended_frame_tensor], dim=2)
-
-                    # Add to frames for GIF creation
-                    # frames.append(Image.fromarray(blended_frame))
+        saliency_dir = "custom_dataset/saliency_maps"
+        for batch_idx in range(4):
+            for view_idx in range(2):
+                for time_idx in range(10):
+                    saliency_map = combined_images_reshape[batch_idx,view_idx,time_idx,:,:]  # (H, W)
+                    saliency_map = saliency_map.unsqueeze(0) 
+                    saliency_map = saliency_map.repeat(3, 1, 1)
+                    # saliency_map = (saliency_map * 255).astype(np.uint8)  # 转换为 [0, 255] 范围
                     to_pil = transforms.ToPILImage()
-
-                    pil_image = to_pil(cat_frame)
-
-                    frames.append(pil_image)
-
-        frames[0].save(
-            f"track_video_{k}.gif", save_all=True, append_images=frames[1:], loop=0, duration=100
-        )
+                    saliency_image = to_pil(saliency_map)
+                    saliency_image.save(os.path.join(saliency_dir, f"saliency_map_pick_up_the_black_bowl_between_the_plate_and_the_ramekin_and_place_it_on_the_plate_{k}_{batch_idx}_{view_idx}_{time_idx}.png"))
         
-        print(f"Saved GIF to {output_gif_path}")
+
+
+
+        # for t in range(combined_images_reshape.shape[2]):  # 遍历时间步
+        #     # Get the current observation frame and the corresponding saliency map frame
+        #     obs_frame = obs[0, 0, t].permute(1, 2, 0).cpu().numpy().astype(np.uint8)  # (H, W, C)
+        #     saliency_frame = combined_images_reshape[0, 0, t, :, :]  # (H, W)
+            
+        #     # Overlay the saliency map onto the observation frame
+        #     blended_frame = overlay_images_v1(obs_frame, saliency_frame, alpha=0.1, beta=0.5)
+        #     blended_frame_tensor = torch.from_numpy(blended_frame)
+        #     saliency_frame = saliency_frame.unsqueeze(0)  # 变成 (1, H, W)
+
+        #     # 然后，如果需要将灰度图扩展到 RGB 形状 (3, H, W)，你可以重复它的通道
+        #     saliency_frame = saliency_frame.repeat(3, 1, 1)  # 变成 (3, H, W)
+
+        #     blended_frame_tensor = blended_frame_tensor.permute(2, 0, 1) 
+
+        #     cat_frame = torch.cat([saliency_frame, blended_frame_tensor], dim=2)
+
+        #     to_pil = transforms.ToPILImage()
+
+        #     pil_image = to_pil(cat_frame)
+
+        #     frames.append(pil_image)
+
+        # frames[0].save(
+        #     f"track_video_{k}.gif", save_all=True, append_images=frames[1:], loop=0, duration=100
+        # )
+        
+        # print(f"Saved GIF to {output_gif_path}")
 
         k += 1
 
 if __name__ == '__main__':
     main()
 
-
-# i = 0
-
-
-# for obs, track_obs, track, task_emb, action, extra_states, track_ori ,vi_ori in tqdm(train_loader):
-#     print(f"shape of obs is {obs.shape}")
-#     print(f"shape of track_obs is {track_obs.shape}")
-#     print(f"shape of track is {track.shape}")
-#     track = track.reshape(-1, 16, 128, 2)
-    
-#     track_gray_maps = tracks_to_grayscale_maps(track, img_size=128)
-
-#     print(f"shape of track vid is {track_gray_maps.shape}")
-
-#     # track_vid_reshape = track_vid.view(4,2,10,3,128,128)#uncomment when using other methods
-#     # track_gray_maps_reshape = np.reshape(track_gray_maps, (4,2,10,128,128,3))
-#     # print(f"shape of track_vid_reshape is {track_gray_maps_reshape.shape}")
-
-#     ooal_images = process_images(obs, model, 128)
-#     track_gray_maps = torch.tensor(track_gray_maps)
-#     ooal_images = torch.tensor(ooal_images)
-
-#     track_gray_maps_norm = normalize_grayscale_image(track_gray_maps)
-#     # print(torch.max(track_gray_maps_norm))
-#     ooal_images_norm = normalize_grayscale_image(ooal_images)
-#     # print(torch.max(ooal_images_norm))
-#     norm_add = track_gray_maps_norm + ooal_images_norm
-#     print(torch.max(norm_add))
-#     norm_add_norm = normalize_grayscale_image(norm_add)
-#     print(torch.max(norm_add_norm))
-#     combined_images = norm_add_norm * 255.00
-#     combined_images = combined_images.to(torch.uint8)
-
-
-
-#     # ooal_images =  ooal_images*1000
-#     # # 设定阈值
-#     # threshold = 50
-
-#     # # 将小于阈值的像素值置为0
-#     # ooal_images = torch.where(ooal_images < threshold, torch.tensor(0.0), ooal_images)
-
-#     # # 按元素相加
-#     # combined_images = track_gray_maps + ooal_images
-#     # print(track_gray_maps)
-#     # print(ooal_images*1000)
-
-#     # 确保图像值在 0 到 255 之间，并转换回 uint8 类型
-#     # combined_images = torch.clamp(combined_images, 0, 255).to(torch.uint8)
-#     # 先分别scale到0-1，加起来之后再scale到0-1
-
-#     # # 将 track_gray_maps 和 ooal_images 都归一化到 0 到 1 之间
-#     # track_min, track_max = track_gray_maps.min(), track_gray_maps.max()
-#     # ooal_min, ooal_max = ooal_images.min(), ooal_images.max()
-
-#     # track_gray_maps_norm = (track_gray_maps - track_min) / (track_max - track_min)
-#     # ooal_images_norm = (ooal_images - ooal_min) / (ooal_max - ooal_min)
-
-#     # # 将它们放缩到 0 到 255 之间
-#     # track_gray_maps_scaled = (track_gray_maps_norm * 255).to(torch.uint8)
-#     # ooal_images_scaled = (ooal_images_norm * 255).to(torch.uint8)
-
-#     # # 合并图像
-#     # combined_images = track_gray_maps_scaled + ooal_images_scaled
-
-#     print(f"shape combined images is {combined_images.shape}")
-#     combined_images_reshape = combined_images.view(4,2,10,128,128)
-
-#     for t in range(combined_images_reshape.shape[2]):  # 遍历时间步
-#         # Get the current observation frame and the corresponding saliency map frame
-#         obs_frame = obs[0, 0, t].permute(1, 2, 0).cpu().numpy().astype(np.uint8)  # (H, W, C)
-#         saliency_frame = combined_images_reshape[0, 0, t, :, :]  # (H, W)
-        
-#         # Overlay the saliency map onto the observation frame
-#         blended_frame = overlay_images_v1(obs_frame, saliency_frame, alpha=0.1, beta=0.5)
-
-#         # Add to frames for GIF creation
-#         frames.append(Image.fromarray(blended_frame))
-
-#     frames[0].save(
-#         f"track_video_{i}.gif", save_all=True, append_images=frames[1:], loop=0, duration=100
-#     )
-    
-#     print(f"Saved GIF to {output_gif_path}")
-#     i+=1
 
  
